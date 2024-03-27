@@ -97,6 +97,8 @@ private:
 
   void serializeGlobal(SILGlobalVariable *global);
 
+  void serializeVTableIfPackageCMO(ClassDecl *classDecl);
+
   void keepMethodAlive(SILDeclRef method);
 
   void makeFunctionUsableFromInline(SILFunction *F);
@@ -374,7 +376,7 @@ bool CrossModuleOptimization::canSerializeType(SILType type) {
     [this](Type rawSubType) {
       CanType subType = rawSubType->getCanonicalType();
       if (NominalTypeDecl *subNT = subType->getNominalOrBoundGenericNominal()) {
-      
+
         if (conservative && subNT->getEffectiveAccess() < AccessLevel::Package) {
           return true;
         }
@@ -482,6 +484,12 @@ bool CrossModuleOptimization::shouldSerialize(SILFunction *function) {
 
     if (function->getLinkage() == SILLinkage::Shared)
       return true;
+  } else if (function->getModule().getOptions().EnableSerializePackage &&
+             (function->getLinkage() == SILLinkage::Package ||
+              function->getLinkage() == SILLinkage::Public)) {
+    // If package-cmo is enabled, we should not limit the amount of inlining
+    // as checked with CMOFunctionSizeLimit below.
+    return true;
   }
 
   // Also serialize "small" non-generic functions.
@@ -503,7 +511,6 @@ void CrossModuleOptimization::serializeFunction(SILFunction *function,
                                        const FunctionFlags &canSerializeFlags) {
   if (function->isSerialized())
     return;
-  
   if (!canSerializeFlags.lookup(function))
     return;
 
@@ -576,9 +583,15 @@ void CrossModuleOptimization::serializeInstruction(SILInstruction *inst,
     return;
   }
   if (auto *REAI = dyn_cast<RefElementAddrInst>(inst)) {
+    // If package-cmo is enabled, serialize V table of this class and
+    // its super class as long as they are inlinable.
+    // Note: serializing witness table of protocol conformance is done
+    // at \c SILWitnessTable::conformanceIsSerialized.
+    serializeVTableIfPackageCMO(REAI->getClassDecl());
     makeDeclUsableFromInline(REAI->getField());
   }
 }
+
 
 void CrossModuleOptimization::serializeGlobal(SILGlobalVariable *global) {
   for (const SILInstruction &initInst : *global) {
@@ -604,6 +617,46 @@ void CrossModuleOptimization::makeFunctionUsableFromInline(SILFunction *function
   if (!isAvailableExternally(function->getLinkage()) &&
       function->getLinkage() != SILLinkage::Public) {
     function->setLinkage(SILLinkage::Public);
+  }
+}
+
+void CrossModuleOptimization::serializeVTableIfPackageCMO(ClassDecl *classDecl) {
+  if (!classDecl || !conservative || !M.getOptions().EnableSerializePackage)
+    return;
+
+  auto *vTable = M.lookUpVTable(classDecl);
+  if (vTable &&
+      !vTable->isSerialized() &&
+      classDecl->getEffectiveAccess() >= AccessLevel::Package) {
+    auto update = true;
+    for (auto &entry : vTable->getEntries()) {
+      if (!canUseFromInline(entry.getImplementation())) {
+        update = false;
+        break;
+      }
+    }
+    if (update) {
+      vTable->setSerialized(IsSerialized);
+    }
+    classDecl->walkSuperclasses([&](ClassDecl *superClassDecl) {
+      auto *vTable = M.lookUpVTable(superClassDecl);
+      if (vTable &&
+          !vTable->isSerialized() &&
+          superClassDecl->getEffectiveAccess() >= AccessLevel::Package) {
+        auto update = true;
+        for (auto &entry : vTable->getEntries()) {
+          if (!canUseFromInline(entry.getImplementation())) {
+            update = false;
+            break;
+          }
+        }
+        if (update) {
+          vTable->setSerialized(IsSerialized);
+          return TypeWalker::Action::Continue;
+        }
+      }
+      return TypeWalker::Action::Stop;
+    });
   }
 }
 
@@ -699,7 +752,8 @@ class CrossModuleOptimizationPass: public SILModuleTransform {
   void run() override {
 
     auto &M = *getModule();
-    if (M.getSwiftModule()->isResilient())
+    if (M.getSwiftModule()->isResilient() &&
+        !M.getOptions().EnableSerializePackage)
       return;
     if (!M.isWholeModule())
       return;

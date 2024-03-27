@@ -167,15 +167,20 @@ void SILWitnessTable::convertToDefinition(
 
 bool SILWitnessTable::conformanceIsSerialized(
     const RootProtocolConformance *conformance) {
+  auto pkgOptIn = conformance->getProtocol()->getASTContext().SILOpts.EnableSerializePackage;
   auto normalConformance = dyn_cast<NormalProtocolConformance>(conformance);
-  if (normalConformance && normalConformance->isResilient())
+
+  // If package-cmo is enabled, we want to serialize witness table (if package
+  // access level or above) even when its defining module is built resiliently.
+  if (normalConformance && normalConformance->isResilient() && !pkgOptIn)
     return false;
 
-  if (conformance->getProtocol()->getEffectiveAccess() < AccessLevel::Public)
+  auto accessLevelToSerialize = pkgOptIn ? AccessLevel::Package : AccessLevel::Public;
+  if (conformance->getProtocol()->getEffectiveAccess() < accessLevelToSerialize)
     return false;
 
   auto *nominal = conformance->getDeclContext()->getSelfNominalTypeDecl();
-  return nominal->getEffectiveAccess() >= AccessLevel::Public;
+  return nominal->getEffectiveAccess() >= accessLevelToSerialize;
 }
 
 bool SILWitnessTable::enumerateWitnessTableConditionalConformances(
